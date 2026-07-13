@@ -18,3 +18,5 @@
 
 # Modify hostname
 #sed -i 's/OpenWrt/P3TERX-Router/g' package/base-files/files/bin/config_generate
+
+sed -i 's/console=${serial_port},1500000/console=${serial_port},115200/' target/linux/rockchip/image/mmc.bootscript
