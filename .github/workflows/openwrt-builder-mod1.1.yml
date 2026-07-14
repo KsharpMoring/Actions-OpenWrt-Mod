@@ -1,0 +1,285 @@
+#
+# 基于 https://github.com/P3TERX/Actions-OpenWrt 改造
+# 适配 2026 年环境：ubuntu-24.04 runner + coolsnowwolf/lede 最新依赖列表
+#
+# File: .github/workflows/openwrt-builder.yml
+# Description: Build OpenWrt (Lean's LEDE) using GitHub Actions
+#
+# Original Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
+# This is free software, licensed under the MIT License.
+#
+
+name: OpenWrt Builder Mod1.1
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions (for make menuconfig)'
+        required: false
+        default: false
+        type: boolean
+      load_config:
+        description: 'Load files/ and config from repo'
+        required: false
+        default: true
+        type: boolean
+      config_file:
+        description: 'Config filename in repo (default: .config)'
+        required: false
+        default: '.config'
+        type: string
+      description:
+        description: 'Custom description shown in the Release notes'
+        required: false
+        default: ''
+        type: string
+      load_custom_feeds:
+        description: 'Load custom feeds (feeds.conf.default + diy-part1.sh)'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  FEEDS_CONF: feeds.conf.default
+  # 手动触发时可自定义文件名；repository_dispatch 触发时 inputs 为空，回退到 .config
+  CONFIG_FILE: ${{ inputs.config_file != '' && inputs.config_file || '.config' }}
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    # ubuntu-22.04 将于 2026-09-17 开始 brownout，2027-04-17 完全下线，改用 24.04
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+
+    - name: Free up disk space
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        # 注意：Ubuntu 24.04 的官方软件源在 /etc/apt/sources.list.d/ubuntu.sources，
+        # 不能像 22.04 那样整个目录 rm 掉，只删第三方源、保留 ubuntu.sources
+        sudo find /etc/apt/sources.list.d -type f ! -name 'ubuntu.sources' -delete
+        # 清理 runner 预装的大件，给编译腾空间（lede 全量编译很吃磁盘）
+        sudo rm -rf \
+          /usr/share/dotnet \
+          /usr/local/lib/android \
+          /opt/ghc \
+          /usr/local/.ghcup \
+          /usr/local/share/powershell \
+          /usr/share/swift \
+          /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        df -hT
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -qq update
+        # 依赖列表来自 coolsnowwolf/lede README（Ubuntu 22/24 适用）：
+        # 相比旧版：去掉 python2.7 / fastjar / msmtp / mkisofs，
+        # 新增 clang / llvm / genisoimage / libnsl-dev
+        sudo -E apt-get -qq install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+          bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext \
+          genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev \
+          libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev \
+          libreadline-dev libssl-dev libtool llvm lrzsz libnsl-dev ninja-build p7zip p7zip-full patch pkgconf \
+          python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion \
+          swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Load custom feeds
+      # 手动触发且取消勾选时跳过（用 lede 自带的 feeds 配置，也不执行 diy-part1.sh）；
+      # repository_dispatch 触发时 inputs 为空(null)，null != false 成立，默认执行
+      if: inputs.load_custom_feeds != false
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      env:
+        # 手动触发且取消勾选 → false；repository_dispatch 触发时 inputs 为空(null)，
+        # null != false 成立 → 默认加载
+        LOAD_CONFIG: ${{ inputs.load_config != false }}
+      run: |
+        if [ "$LOAD_CONFIG" = "true" ]; then
+          [ -e files ] && mv files openwrt/files
+          [ -e "$CONFIG_FILE" ] && mv "$CONFIG_FILE" openwrt/.config
+        else
+          echo "Skip loading files/ and $CONFIG_FILE from repo"
+        fi
+        # diy-part2.sh 始终执行（与是否加载配置无关）
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: SSH connection to Actions
+      uses: mxschmitt/action-tmate@v3
+      if: inputs.ssh == true
+      with:
+        # 只允许触发者本人（用你 GitHub 账号里登记的 SSH 公钥认证）连接。
+        # 如果你的 GitHub 账号没有添加 SSH key，这里要改成 false，
+        # 但公开仓库的日志任何人可见，false 意味着别人也可能抢先连上，务必注意
+        limit-access-to-actor: true
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@v6
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+
+    - name: Organize files
+      id: organize
+      if: (env.UPLOAD_FIRMWARE == 'true' || env.UPLOAD_RELEASE == 'true') && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        # 把本次编译实际使用的完整 .config 复制进输出目录
+        # （改名去掉前导点：Release 上传的 * 通配符不匹配隐藏文件）
+        cp "$GITHUB_WORKSPACE/openwrt/.config" build.config
+        # 先把整个输出目录（含 packages/ 里编译出的全部 ipk）打成一个包，
+        # 供 Artifact 上传用（tar 打包可保留权限/符号链接，绕开 upload-artifact 的已知限制）
+        ARCHIVE="$GITHUB_WORKSPACE/OpenWrt${DEVICE_NAME}${FILE_DATE}.tar.gz"
+        tar -zcf "$ARCHIVE" .
+        echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+        # 打包之后再删 packages/，让 Release 里只有散装的固件文件
+        rm -rf packages
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@v6
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.ARCHIVE }}
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      env:
+        # 计算方式与各 step 实际生效的逻辑保持一致，
+        # repository_dispatch 触发时 inputs 为空，这里显示的即默认行为
+        ARG_SSH: ${{ inputs.ssh == true }}
+        ARG_FEEDS: ${{ inputs.load_custom_feeds != false }}
+        ARG_LOAD_CONFIG: ${{ inputs.load_config != false }}
+        # 用户自由文本务必经环境变量传入 shell，
+        # 直接内插 ${{ }} 到脚本里会有命令注入风险
+        ARG_DESC: ${{ inputs.description }}
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        # 原版这里有一行引用不存在的 UPLOAD_GOFILE / steps.gofile 的语句，
+        # 会导致本 step 报错、status 写不进去、Release 永远不上传，已删除
+        DESC_LINE=""
+        # 末尾多带一个换行：Markdown 引用块若不以空行结束，会把下一行内容吸进引用里
+        [ -n "$ARG_DESC" ] && DESC_LINE="> $ARG_DESC"$'\n'
+        cat > release.txt << EOF
+        ### ${{ github.workflow }} #${{ github.run_number }}
+
+        $DESC_LINE
+        [查看本次运行日志](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+        - 编译时间: $(date +"%Y-%m-%d %H:%M")
+        - 触发方式: ${{ github.event_name }}
+
+        **本次生效的编译参数**
+        | 参数 | 值 |
+        | --- | --- |
+        | SSH 调试 (ssh) | $ARG_SSH |
+        | 加载自定义 feeds (load_custom_feeds) | $ARG_FEEDS |
+        | 加载仓库配置 (load_config) | $ARG_LOAD_CONFIG |
+        | 配置文件名 (config_file) | $CONFIG_FILE |
+        EOF
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v3
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    # 清理只作用于"成功"的运行记录：在成功记录里保留最新 2 条 + 本次 = 共 3 条，
+    # 与 Release 数量一一对应。
+    # 失败/取消的记录不做任何自动清理（conclusion 白名单只放行 success），
+    # 保留其日志供排查，确认不再需要后到 Actions 页面手动删除即可
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@v2
+      with:
+        retain_days: 0
+        keep_minimum_runs: 5
+        delete_run_by_conclusion_pattern: "success"
+
+    - name: Remove old Releases
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # 保留最新 3 个 Release，删除更旧的（连同 tag 一起清理）
+        # gh release list 默认按时间倒序输出，跳过前 3 行即为待删列表
+        # 注意：Release 和 tag 分开删。历史遗留的 Release 可能没有对应 tag，
+        # 若用 --cleanup-tag 一步到位，删 tag 时 422 会让整个 step 失败
+        gh release list --limit 100 --json tagName --jq '.[].tagName' | tail -n +7 | \
+        while read -r tag; do
+          echo "Deleting release: $tag"
+          gh release delete "$tag" --yes || echo "  release $tag not found, skip"
+          gh api --silent -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" \
+            || echo "  tag $tag not found, skip"
+        done
